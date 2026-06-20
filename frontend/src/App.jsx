@@ -232,9 +232,10 @@ export default function App() {
         body:JSON.stringify({url:target}),
       });
       if (!res.ok) {
+        const text = await res.text();
         let msg;
-        try { const err=await res.json(); msg=err.detail; } catch { msg=await res.text().then(t=>t.slice(0,100)); }
-        throw new Error(msg||`Server error ${res.status}`);
+        try { msg = JSON.parse(text).detail; } catch { msg = text.slice(0, 120); }
+        throw new Error(msg || `Server error ${res.status}`);
       }
       const json = await res.json();
       setData(json);
