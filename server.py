@@ -1,8 +1,8 @@
 import logging
 import os
 import random
-import subprocess
 import time
+import urllib.request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,15 +56,15 @@ USER_AGENTS = [
 ]
 
 
-def _curl(url: str) -> str:
+def _fetch(url: str) -> str:
     ua = random.choice(USER_AGENTS)
-    result = subprocess.run(
-        ["curl", "-s", "-H", f"User-Agent: {ua}", "--max-time", "15", url],
-        capture_output=True, text=True, timeout=20,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"curl failed: {result.stderr}")
-    return result.stdout
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
 @app.get("/")
@@ -79,7 +79,7 @@ def health():
 
 @app.get("/top-posts")
 def top_posts(limit: int = 10):
-    html = _curl("https://old.reddit.com/r/all/top/?t=day")
+    html = _fetch("https://old.reddit.com/r/all/top/?t=day")
     soup = BeautifulSoup(html, "html.parser")
     things = soup.find_all("div", class_="thing", id=lambda x: x and x.startswith("thing_t3_"))
     posts = []

@@ -1,8 +1,8 @@
 import re
 import time
 import logging
-import subprocess
 import random
+import urllib.request
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -60,20 +60,13 @@ class RedditScraper:
     def _fetch(self, url):
         self._respect_rate_limit()
         ua = random.choice(USER_AGENTS)
-        result = subprocess.run(
-            [
-                "curl", "-s",
-                "-H", f"User-Agent: {ua}",
-                "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "-H", "Accept-Language: en-US,en;q=0.9",
-                "--max-time", "30",
-                url,
-            ],
-            capture_output=True, text=True, timeout=35,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"curl failed: {result.stderr}")
-        return result.stdout
+        req = urllib.request.Request(url, headers={
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
 
     def fetch_post(self, url: str) -> RedditPost:
         parsed = urlparse(url)
