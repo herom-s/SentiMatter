@@ -20,10 +20,11 @@ log = logging.getLogger("server")
 
 app = FastAPI(title="SentiMatter API", version="1.0.0")
 
+cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
+    allow_origins=["*"] if cors_origins == ["*"] else cors_origins,
+    allow_credentials=os.getenv("CORS_ORIGINS") is not None,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -104,6 +105,11 @@ def top_posts(limit: int = 10):
             "subreddit": subreddit,
         })
     return posts
+
+
+@app.get("/analyze")
+def analyze_get():
+    return {"message": "Send a POST request with {\"url\": \"...\"}"}
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
