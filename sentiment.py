@@ -1,4 +1,6 @@
 import logging
+import random
+from functools import lru_cache
 
 import torch
 from transformers import pipeline
@@ -16,10 +18,19 @@ EMOTION_LABELS = [
     "sadness", "surprise", "neutral",
 ]
 
+MAX_TOKENS = 384
+COMMENT_LIMIT = 80
+BATCH_SIZE = 32
+
+
+def _to_scores(result):
+    return {item["label"]: round(item["score"], 4) for item in result}
+
 
 class SentimentAnalyzer:
     def __init__(self, model_name="SamLowe/roberta-base-go_emotions"):
         log.info("Loading emotion model: %s", model_name)
+        torch.set_num_threads(4)
         device = 0 if torch.cuda.is_available() else -1
         self._pipe = pipeline(
             "text-classification",
@@ -32,8 +43,8 @@ class SentimentAnalyzer:
         if not text or not text.strip():
             return {label: 0.0 for label in EMOTION_LABELS}
 
-        results = self._pipe(text[:512])[0]
-        scores = {item["label"]: round(item["score"], 4) for item in results}
+        results = self._pipe(text[:MAX_TOKENS])[0]
+        scores = _to_scores(results)
 
         for label in EMOTION_LABELS:
             scores.setdefault(label, 0.0)
@@ -41,17 +52,17 @@ class SentimentAnalyzer:
         return scores
 
     def analyze_batch(self, texts: list[str]) -> list[dict]:
-        cleaned = [t[:512] if t and t.strip() else "" for t in texts]
+        cleaned = [t[:MAX_TOKENS] if t and t.strip() else "" for t in texts]
         batch = [t for t in cleaned if t]
         if not batch:
             return [{label: 0.0 for label in EMOTION_LABELS} for _ in texts]
 
-        pipe_results = self._pipe(batch)
+        pipe_results = self._pipe(batch, batch_size=BATCH_SIZE)
         all_scores = []
         idx = 0
         for t in cleaned:
             if t:
-                scores = {item["label"]: round(item["score"], 4) for item in pipe_results[idx]}
+                scores = _to_scores(pipe_results[idx])
                 for label in EMOTION_LABELS:
                     scores.setdefault(label, 0.0)
                 all_scores.append(scores)
@@ -60,13 +71,14 @@ class SentimentAnalyzer:
                 all_scores.append({label: 0.0 for label in EMOTION_LABELS})
         return all_scores
 
-    def analyze_post(self, title: str, body: str, comments: list[dict]) -> dict:
+    def analyze_post(self, title: str, body: str, comments: list[dict], max_comments: int = COMMENT_LIMIT) -> dict:
         title_scores = self.analyze(title)
         body_scores = self.analyze(body)
 
         comment_scores = {label: 0.0 for label in EMOTION_LABELS}
         if comments:
-            texts = [c["text"] for c in comments]
+            sample = random.sample(comments, min(max_comments, len(comments)))
+            texts = [c["text"] for c in sample]
             batch_results = self.analyze_batch(texts)
             count = 0
             for cs in batch_results:
@@ -81,9 +93,9 @@ class SentimentAnalyzer:
         aggregated = {}
         for label in EMOTION_LABELS:
             aggregated[label] = round(
-                (title_scores.get(label, 0) * 0.2)
-                + (body_scores.get(label, 0) * 0.3)
-                + (comment_scores.get(label, 0) * 0.5),
+                title_scores.get(label, 0) * 0.2
+                + body_scores.get(label, 0) * 0.3
+                + comment_scores.get(label, 0) * 0.5,
                 4,
             )
 
