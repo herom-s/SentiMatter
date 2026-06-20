@@ -67,6 +67,11 @@ def _curl(url: str) -> str:
     return result.stdout
 
 
+@app.get("/")
+def root():
+    return {"name": "SentiMatter API", "version": "1.0.0", "status": "ok"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
