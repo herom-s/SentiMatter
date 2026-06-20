@@ -231,7 +231,11 @@ export default function App() {
         method:"POST", headers:{"Content-Type":"application/json"},
         body:JSON.stringify({url:target}),
       });
-      if (!res.ok) { const err=await res.json(); throw new Error(err.detail||`Server error ${res.status}`); }
+      if (!res.ok) {
+        let msg;
+        try { const err=await res.json(); msg=err.detail; } catch { msg=await res.text().then(t=>t.slice(0,100)); }
+        throw new Error(msg||`Server error ${res.status}`);
+      }
       const json = await res.json();
       setData(json);
       addRecent(target, json.post.title);
@@ -266,7 +270,7 @@ export default function App() {
       <div className="ex">
         <span className="ex-label">Today's top posts:</span>
         {examplesError ? (
-          <span className="ex-err">Could not load — paste manually</span>
+          <span className="ex-err">Could not load top posts — paste a URL manually to analyze</span>
         ) : examples.length === 0 ? (
           <span className="ex-load"><span className="ex-spin"/><span>Loading…</span></span>
         ) : (
