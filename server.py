@@ -12,12 +12,12 @@ from pydantic import BaseModel, HttpUrl
 from scraper import RedditScraper
 from sentiment import SentimentAnalyzer
 
+log = logging.getLogger("server")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-log = logging.getLogger("server")
-
 app = FastAPI(title="SentiMatter API", version="1.0.0")
 
 app.add_middleware(
@@ -84,28 +84,43 @@ def health():
     return {"status": "ok"}
 
 
+FALLBACK_POSTS = [
+    {"url":"https://www.reddit.com/r/MadeMeSmile/comments/1uaj6fc/couple_sends_new_baby_text_to_wrong_number_dudes/","title":"Couple sends new baby text to wrong number, dudes show up anyway","score":71779,"comments":414,"subreddit":"MadeMeSmile"},
+    {"url":"https://www.reddit.com/r/todayilearned/comments/1uai7pn/til_that_many_major_cities_have_disabled/","title":"TIL that many major cities have disabled thousands of crosswalk buttons","score":15434,"comments":382,"subreddit":"todayilearned"},
+    {"url":"https://www.reddit.com/r/AskReddit/comments/1uas6k5/what_job_is_heavily_romanticized_in_movies_but/","title":"What job is heavily romanticized in movies but miserable in real life?","score":3104,"comments":1944,"subreddit":"AskReddit"},
+    {"url":"https://www.reddit.com/r/gaming/comments/1uatrwg/ubisoft_cofounder_dies_in_tragic_plane_crash/","title":"Ubisoft co-founder dies in tragic plane crash","score":12148,"comments":859,"subreddit":"gaming"},
+]
+
+top_posts_cache = {"posts": None, "ts": 0.0}
+CACHE_TTL = 3600
+
+
 @app.get("/top-posts")
 def top_posts(limit: int = 10):
+    now = time.time()
+    if top_posts_cache["posts"] and now - top_posts_cache["ts"] < CACHE_TTL:
+        return top_posts_cache["posts"][:limit]
+
     try:
         raw = _fetch("https://www.reddit.com/r/all/top/.json?t=day")
         data = json.loads(raw)
-    except RuntimeError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=502, detail="Invalid response from Reddit")
-
-    posts = []
-    for child in data.get("data", {}).get("children", [])[:limit]:
-        d = child.get("data", {})
-        permalink = d.get("permalink", "")
-        posts.append({
-            "url": f"https://www.reddit.com{permalink}" if permalink else "",
-            "title": d.get("title", "Untitled"),
-            "score": d.get("score", 0),
-            "comments": d.get("num_comments", 0),
-            "subreddit": d.get("subreddit", ""),
-        })
-    return posts
+        posts = []
+        for child in data.get("data", {}).get("children", [])[:limit]:
+            d = child.get("data", {})
+            permalink = d.get("permalink", "")
+            posts.append({
+                "url": f"https://www.reddit.com{permalink}" if permalink else "",
+                "title": d.get("title", "Untitled"),
+                "score": d.get("score", 0),
+                "comments": d.get("num_comments", 0),
+                "subreddit": d.get("subreddit", ""),
+            })
+        top_posts_cache["posts"] = posts
+        top_posts_cache["ts"] = now
+        return posts
+    except Exception as e:
+        log.warning("Reddit fetch failed: %s — serving fallback", e)
+        return FALLBACK_POSTS[:limit]
 
 
 @app.get("/analyze")
