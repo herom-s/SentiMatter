@@ -40,16 +40,37 @@ class SentimentAnalyzer:
 
         return scores
 
+    def analyze_batch(self, texts: list[str]) -> list[dict]:
+        cleaned = [t[:512] if t and t.strip() else "" for t in texts]
+        batch = [t for t in cleaned if t]
+        if not batch:
+            return [{label: 0.0 for label in EMOTION_LABELS} for _ in texts]
+
+        pipe_results = self._pipe(batch)
+        all_scores = []
+        idx = 0
+        for t in cleaned:
+            if t:
+                scores = {item["label"]: round(item["score"], 4) for item in pipe_results[idx]}
+                for label in EMOTION_LABELS:
+                    scores.setdefault(label, 0.0)
+                all_scores.append(scores)
+                idx += 1
+            else:
+                all_scores.append({label: 0.0 for label in EMOTION_LABELS})
+        return all_scores
+
     def analyze_post(self, title: str, body: str, comments: list[dict]) -> dict:
         title_scores = self.analyze(title)
         body_scores = self.analyze(body)
 
         comment_scores = {label: 0.0 for label in EMOTION_LABELS}
         if comments:
+            texts = [c["text"] for c in comments]
+            batch_results = self.analyze_batch(texts)
             count = 0
-            for c in comments:
-                if c["text"].strip():
-                    cs = self.analyze(c["text"])
+            for cs in batch_results:
+                if any(v != 0.0 for v in cs.values()):
                     for label in EMOTION_LABELS:
                         comment_scores[label] += cs.get(label, 0.0)
                     count += 1
