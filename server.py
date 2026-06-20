@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -7,7 +8,6 @@ import urllib.request
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from bs4 import BeautifulSoup
 
 from scraper import RedditScraper
 from sentiment import SentimentAnalyzer
@@ -87,31 +87,23 @@ def health():
 @app.get("/top-posts")
 def top_posts(limit: int = 10):
     try:
-        html = _fetch("https://old.reddit.com/r/all/top/?t=day")
+        raw = _fetch("https://www.reddit.com/r/all/top/.json?t=day")
+        data = json.loads(raw)
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    soup = BeautifulSoup(html, "html.parser")
-    things = soup.find_all("div", class_="thing", id=lambda x: x and x.startswith("thing_t3_"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail="Invalid response from Reddit")
+
     posts = []
-    for thing in things[:limit]:
-        title_el = thing.find("a", class_="title")
-        title = title_el.get_text(strip=True) if title_el else "Untitled"
-        permalink = thing.get("data-permalink", "")
-        url = f"https://www.reddit.com{permalink}" if permalink else ""
-        score = int(thing.get("data-score", 0))
-        comments = int(thing.get("data-comments-count", 0))
-        domain_el = thing.find("span", class_="domain")
-        subreddit = ""
-        if domain_el:
-            sub_text = domain_el.get_text(strip=True)
-            if sub_text.startswith("(") and sub_text.endswith(")"):
-                subreddit = sub_text[1:-1]
+    for child in data.get("data", {}).get("children", [])[:limit]:
+        d = child.get("data", {})
+        permalink = d.get("permalink", "")
         posts.append({
-            "url": url,
-            "title": title,
-            "score": score,
-            "comments": comments,
-            "subreddit": subreddit,
+            "url": f"https://www.reddit.com{permalink}" if permalink else "",
+            "title": d.get("title", "Untitled"),
+            "score": d.get("score", 0),
+            "comments": d.get("num_comments", 0),
+            "subreddit": d.get("subreddit", ""),
         })
     return posts
 
