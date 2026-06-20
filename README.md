@@ -2,27 +2,74 @@
 
 Scrape any Reddit post and run a 28-emotion sentiment analysis — no official API required.
 
-## How it works
+Uses **GoEmotions** (27 emotions + neutral) via `SamLowe/roberta-base-go_emotions`.
 
-1. **`scraper.py`** — shells out to `curl` to scrape `old.reddit.com` HTML (bypasses bot detection), parses with BeautifulSoup. Extracts the post title, author, score, body text, and all comment threads.
-2. **`sentiment.py`** — runs `SamLowe/roberta-base-go_emotions` via HuggingFace Transformers, scoring text across all 28 GoEmotions categories (admiration, amusement, anger, annoyance, approval, caring, confusion, curiosity, desire, disappointment, disapproval, disgust, embarrassment, excitement, fear, gratitude, grief, joy, love, nervousness, optimism, pride, realization, relief, remorse, sadness, surprise, neutral).
-3. **`main.py`** — CLI that fetches a post, runs sentiment per-section (title / body / comments avg), and prints an aggregated 20/30/50 weighted result with a visual bar chart.
+## Stack
 
-## Usage
+| Layer | Tech | Deploy |
+|-------|------|--------|
+| CLI | Python (argparse) | — |
+| API | FastAPI + uvicorn | Railway |
+| Frontend | React + Vite | Vercel |
+| ML | HuggingFace Transformers + PyTorch | — |
+
+## Local dev
 
 ```bash
-# Create venv & install
+# Backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+uvicorn server:app --reload
 
-# Run
-python main.py "https://www.reddit.com/r/pics/comments/1uaw9hw/..." --delay 4.0
+# Frontend (separate terminal)
+cd frontend && npm install && npm run dev
 ```
 
-The `--delay` flag controls the gap between requests (Reddit rate-limits aggressively).
+### CLI usage (no server needed)
+
+```bash
+python main.py "https://www.reddit.com/r/..." --delay 2.0
+```
+
+### API endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Health check |
+| `/health` | GET | Health check |
+| `/top-posts?limit=10` | GET | Scrapes today's top Reddit posts |
+| `/analyze` | POST | Analyze a post: `{"url": "..."}` |
+
+## Deploy
+
+### Backend → Railway
+
+Push to GitHub, connect repo in Railway. Auto-detected via `requirements.txt` + `railway.toml`.
+
+Set env vars:
+
+| Variable | Value |
+|----------|-------|
+| `CORS_ORIGINS` | `https://your-frontend.vercel.app` |
+
+### Frontend → Vercel
+
+Set root directory to `frontend/` in Vercel project settings.
+
+Set env var:
+
+| Variable | Value |
+|----------|-------|
+| `VITE_API_URL` | `https://your-backend.railway.app` |
+
+## Architecture
+
+1. **`scraper.py`** — fetches `old.reddit.com` HTML via `urllib`, parses with BeautifulSoup. Extracts title, author, score, body, comments.
+2. **`sentiment.py`** — runs the HuggingFace model. Batches comments (up to 80, random sample) for speed. Returns scores across all 28 emotions per section (title / body / comments / weighted aggregate).
+3. **`server.py`** — FastAPI server wrapping scraper + sentiment into REST endpoints.
+4. **`frontend/`** — React SPA with emotion bar charts, summary cards, and live top-post examples.
 
 ## Requirements
 
 - Python 3.10+
-- `curl` on `$PATH`
-- Internet connection (model downloads on first run, ~500 MB)
+- Internet connection (model downloads ~500 MB on first run)
