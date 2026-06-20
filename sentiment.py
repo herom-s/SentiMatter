@@ -1,6 +1,5 @@
 import logging
 import random
-from functools import lru_cache
 
 import torch
 from transformers import pipeline
@@ -18,7 +17,6 @@ EMOTION_LABELS = [
     "sadness", "surprise", "neutral",
 ]
 
-MAX_TOKENS = 384
 COMMENT_LIMIT = 80
 BATCH_SIZE = 32
 
@@ -43,7 +41,7 @@ class SentimentAnalyzer:
         if not text or not text.strip():
             return {label: 0.0 for label in EMOTION_LABELS}
 
-        results = self._pipe(text[:MAX_TOKENS])[0]
+        results = self._pipe(text, truncation=True, max_length=512)[0]
         scores = _to_scores(results)
 
         for label in EMOTION_LABELS:
@@ -52,12 +50,12 @@ class SentimentAnalyzer:
         return scores
 
     def analyze_batch(self, texts: list[str]) -> list[dict]:
-        cleaned = [t[:MAX_TOKENS] if t and t.strip() else "" for t in texts]
+        cleaned = [t if t and t.strip() else "" for t in texts]
         batch = [t for t in cleaned if t]
         if not batch:
             return [{label: 0.0 for label in EMOTION_LABELS} for _ in texts]
 
-        pipe_results = self._pipe(batch, batch_size=BATCH_SIZE)
+        pipe_results = self._pipe(batch, batch_size=BATCH_SIZE, truncation=True, max_length=512)
         all_scores = []
         idx = 0
         for t in cleaned:
