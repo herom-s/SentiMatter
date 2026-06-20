@@ -234,8 +234,8 @@ export default function App() {
       if (!res.ok) {
         const text = await res.text();
         let msg;
-        try { msg = JSON.parse(text).detail; } catch { msg = text.slice(0, 120); }
-        throw new Error(msg || `Server error ${res.status}`);
+        try { msg = JSON.parse(text).detail; } catch { msg = ""; }
+        throw new Error(msg || "Backend is unreachable — make sure the API server is running");
       }
       const json = await res.json();
       setData(json);
