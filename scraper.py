@@ -1,8 +1,10 @@
-import re
-import time
 import logging
 import random
+import re
+import time
+import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -16,20 +18,46 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
+ATOM_NS = "http://www.w3.org/2005/Atom"
+_BLOCK_TAGS = {"p", "div", "li", "blockquote", "pre", "table", "tr",
+               "h1", "h2", "h3", "h4", "h5", "h6"}
 
-def _parse_score(raw: str) -> int:
-    raw = raw.replace(",", "").replace("points", "").replace("point", "").strip()
-    multiplier = 1
-    if raw.endswith(("k", "K")):
-        multiplier = 1_000
-        raw = raw[:-1]
-    elif raw.endswith(("m", "M")):
-        multiplier = 1_000_000
-        raw = raw[:-1]
-    try:
-        return int(float(raw) * multiplier)
-    except ValueError:
-        return 0
+
+def _q(tag: str) -> str:
+    return f"{{{ATOM_NS}}}{tag}"
+
+
+def _content_to_text(html: str) -> str:
+    """Convert an Atom <content> HTML body to plain text.
+
+    Prefers the `div.md` element (real post/comment body); falls back to the
+    full content text. For link posts the content is a thumbnail table with no
+    selftext — boilerplate is stripped and the result is an empty string.
+    """
+    if not html.strip():
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    md = soup.find("div", class_="md")
+    node = md if md is not None else soup
+    for br in node.find_all("br"):
+        br.replace_with("\n")
+    for block in node.find_all(sorted(_BLOCK_TAGS)):
+        block.append("\n")
+    text = re.sub(r"[ \t]+", " ", node.get_text(" "))
+    text = re.sub(r" *\n *", "\n", text).strip()
+    if md is None:
+        text = _strip_boilerplate(text)
+    return text
+
+
+def _strip_boilerplate(text: str) -> str:
+    """Remove the "[link] [comments] submitted by /u/… to r/…" wrapper that
+    Reddit uses for link-post bodies; an empty remainder means no selftext."""
+    text = re.sub(r"\[(link|comments|removed|deleted)\]", " ", text)
+    text = re.sub(r"submitted\s+by", " ", text)
+    text = re.sub(r"/u/\S+", " ", text)
+    text = re.sub(r"r/\S+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class RedditPost:
@@ -49,7 +77,7 @@ class RedditPost:
 
 
 class RedditScraper:
-    BASE = "https://old.reddit.com"
+    BASE = "https://www.reddit.com"
 
     def __init__(self, delay=2.0, max_retries=3):
         self.delay = delay
@@ -58,95 +86,127 @@ class RedditScraper:
     def _respect_rate_limit(self):
         time.sleep(self.delay + random.uniform(0.5, 1.5))
 
-    def _fetch(self, url):
-        self._respect_rate_limit()
-        ua = random.choice(USER_AGENTS)
-        headers = {
-            "User-Agent": ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    @staticmethod
+    def _headers() -> dict[str, str]:
+        return {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "application/atom+xml,application/rss+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Cache-Control": "no-cache",
             "Pragma": "no-cache",
         }
-        req = urllib.request.Request(url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            log.warning("HTTP %d fetching %s", e.code, url)
-            raise RuntimeError(f"Reddit returned {e.code} — blocked or rate-limited")
+
+    def _fetch(self, url: str) -> str:
+        last_error: Exception | None = None
+        for attempt in range(max(1, self.max_retries)):
+            self._respect_rate_limit()
+            req = urllib.request.Request(url, headers=self._headers())
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 404, 429):
+                    log.warning("HTTP %d fetching %s", e.code, url)
+                    reason = {403: "blocked", 404: "post not found or removed", 429: "rate limited"}
+                    raise RuntimeError(f"Reddit RSS returned {e.code} — {reason[e.code]}") from e
+                last_error = e
+                log.warning("HTTP %d fetching %s (attempt %d/%d)", e.code, url, attempt + 1, self.max_retries)
+            except (urllib.error.URLError, OSError) as e:
+                last_error = e
+                log.warning("Network error fetching %s: %s (attempt %d/%d)", url, e, attempt + 1, self.max_retries)
+        raise RuntimeError(
+            f"Reddit RSS unreachable after {self.max_retries} attempts: {last_error}"
+        ) from last_error
 
     def fetch_post(self, url: str) -> RedditPost:
-        parsed = urlparse(url)
-        path = parsed.path.rstrip("/")
+        xml = self._fetch(self._post_feed_url(url))
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError as e:
+            raise RuntimeError(f"Reddit RSS was not valid XML: {e}") from e
+
+        post_entry = None
+        comment_entries: list[ET.Element] = []
+        for entry in root.findall(_q("entry")):
+            entry_id = (entry.findtext(_q("id")) or "").strip()
+            if entry_id.startswith("t3_"):
+                post_entry = entry
+            elif entry_id.startswith("t1_"):
+                comment_entries.append(entry)
+
+        if post_entry is None:
+            raise RuntimeError("Reddit RSS contained no post entry — post may be removed")
+
+        title = (post_entry.findtext(_q("title")) or "").strip()
+        author = self._entry_author(post_entry)
+        text = _content_to_text(self._entry_content(post_entry))
+        link = self._entry_link(post_entry)
+        comments = [
+            {"author": self._entry_author(entry), "score": 0,
+             "text": _content_to_text(self._entry_content(entry))}
+            for entry in comment_entries
+        ]
+        comments = [c for c in comments if c["text"]]
+        return RedditPost(url=link or url, title=title, author=author, score=0, text=text, comments=comments)
+
+    def fetch_listing(self, limit: int = 10) -> list[dict]:
+        xml = self._fetch(f"{self.BASE}/r/all/top/.rss?t=day")
+        try:
+            root = ET.fromstring(xml)
+        except ET.ParseError as e:
+            raise RuntimeError(f"Reddit RSS was not valid XML: {e}") from e
+
+        posts: list[dict] = []
+        for entry in root.findall(_q("entry")):
+            if len(posts) >= limit:
+                break
+            if not (entry.findtext(_q("id")) or "").startswith("t3_"):
+                continue
+            posts.append({
+                "url": self._entry_link(entry),
+                "title": (entry.findtext(_q("title")) or "").strip() or "Untitled",
+                "score": 0,
+                "comments": 0,
+                "subreddit": self._entry_subreddit(entry),
+            })
+        if not posts:
+            raise RuntimeError("No posts found in Reddit RSS listing")
+        return posts
+
+    def _post_feed_url(self, url: str) -> str:
+        path = urlparse(url).path.rstrip("/")
         if not path.startswith("/r/"):
             raise ValueError(f"Not a valid Reddit post URL: {url}")
+        if path.endswith(".rss"):
+            return f"{self.BASE}{path}"
+        return f"{self.BASE}{path}.rss"
 
-        html = None
-        for attempt in range(self.max_retries):
-            try:
-                html = self._fetch(f"{self.BASE}{path}/")
-                if "Please wait for verification" in html:
-                    raise RuntimeError("Blocked by JS challenge")
-                break
-            except Exception:
-                if attempt < self.max_retries - 1:
-                    wait = (attempt + 1) * 5
-                    log.warning("Retrying in %ds…", wait)
-                    time.sleep(wait)
-                else:
-                    raise
+    @staticmethod
+    def _entry_author(entry: ET.Element) -> str:
+        name_el = entry.find(f"{_q('author')}/{_q('name')}")
+        name = (name_el.text or "").strip() if name_el is not None else ""
+        if name.startswith("/u/"):
+            name = name[3:]
+        if not name or name in ("[deleted]", "[removed]"):
+            return "unknown"
+        return name
 
-        soup = BeautifulSoup(html, "html.parser")
+    @staticmethod
+    def _entry_content(entry: ET.Element) -> str:
+        content = entry.find(_q("content"))
+        return "".join(content.itertext()) if content is not None else ""
 
-        thing = soup.find("div", class_="thing", id=lambda x: x and x.startswith("thing_t3_"))
-        if not thing:
-            raise RuntimeError("Could not find post data on page")
+    @staticmethod
+    def _entry_link(entry: ET.Element) -> str:
+        for link in entry.findall(_q("link")):
+            href = link.get("href")
+            if href:
+                return href
+        return ""
 
-        title_el = thing.find("a", class_="title")
-        title = title_el.get_text(strip=True) if title_el else ""
-
-        author_el = thing.find("a", class_="author")
-        author = author_el.get_text(strip=True) if author_el else "unknown"
-
-        score = int(thing.get("data-score", 0)) if thing.get("data-score") else 0
-        if score == 0:
-            score_el = thing.find("span", class_="score")
-            if score_el:
-                score = _parse_score(score_el.get_text(strip=True))
-
-        text = ""
-        expando = thing.find("div", class_="expando")
-        if expando:
-            md = expando.find("div", class_="md")
-            if md:
-                for br in md.find_all("br"):
-                    br.replace_with("\n")
-                text = md.get_text(strip=True)
-
-        comments = self._extract_comments(soup)
-
-        return RedditPost(url=url, title=title, author=author, score=score, text=text, comments=comments)
-
-    def _extract_comments(self, soup):
-        comments = []
-        for entry in soup.find_all("div", class_="entry"):
-            if entry.find_parent("div", class_="link"):
-                continue
-            md = entry.find("div", class_="md")
-            if not md:
-                continue
-            for br in md.find_all("br"):
-                br.replace_with("\n")
-            text = md.get_text(strip=True)
-            if not text:
-                continue
-
-            author_el = entry.find("a", class_="author")
-            author = author_el.get_text(strip=True) if author_el else "unknown"
-
-            score_el = entry.find("span", class_="score")
-            score = _parse_score(score_el.get_text(strip=True)) if score_el else 0
-
-            comments.append({"author": author, "score": score, "text": text})
-        return comments
+    @staticmethod
+    def _entry_subreddit(entry: ET.Element) -> str:
+        category = entry.find(_q("category"))
+        if category is None:
+            return ""
+        return (category.get("term") or "").strip()

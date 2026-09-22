@@ -1,9 +1,6 @@
-import json
 import logging
 import os
-import random
 import time
-import urllib.request
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,32 +45,6 @@ class AnalyzeResponse(BaseModel):
     elapsed: float
 
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-]
-
-
-def _fetch(url: str) -> str:
-    ua = random.choice(USER_AGENTS)
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-    }
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        log.warning("HTTP %d fetching %s", e.code, url)
-        raise RuntimeError(f"Reddit returned {e.code} — try again later")
-
-
 @app.get("/")
 def root():
     return {"name": "SentiMatter API", "version": "1.0.0", "status": "ok"}
@@ -102,25 +73,13 @@ def top_posts(limit: int = 10):
         return top_posts_cache["posts"][:limit]
 
     try:
-        raw = _fetch("https://www.reddit.com/r/all/top/.json?t=day")
-        data = json.loads(raw)
-        posts = []
-        for child in data.get("data", {}).get("children", [])[:limit]:
-            d = child.get("data", {})
-            permalink = d.get("permalink", "")
-            posts.append({
-                "url": f"https://www.reddit.com{permalink}" if permalink else "",
-                "title": d.get("title", "Untitled"),
-                "score": d.get("score", 0),
-                "comments": d.get("num_comments", 0),
-                "subreddit": d.get("subreddit", ""),
-            })
-        top_posts_cache["posts"] = posts
-        top_posts_cache["ts"] = now
-        return posts
+        posts = RedditScraper(delay=0).fetch_listing(limit=limit)
     except Exception as e:
         log.warning("Reddit fetch failed: %s — serving fallback", e)
         return FALLBACK_POSTS[:limit]
+    top_posts_cache["posts"] = posts
+    top_posts_cache["ts"] = now
+    return posts
 
 
 @app.get("/analyze")

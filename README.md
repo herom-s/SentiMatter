@@ -64,7 +64,7 @@ Set env var:
 
 ## Architecture
 
-1. **`scraper.py`** — fetches `old.reddit.com` HTML via `urllib`, parses with BeautifulSoup. Extracts title, author, score, body, comments.
+1. **`scraper.py`** — fetches Reddit's public RSS/Atom feeds via `urllib` (`https://www.reddit.com{path}/.rss`), parses with `xml.etree` and converts body/comment HTML to text with BeautifulSoup. Extracts title, author, body and comments (score unavailable in RSS, set to 0).
 2. **`sentiment.py`** — runs the HuggingFace model. Batches comments (up to 80, random sample) for speed. Returns scores across all 28 emotions per section (title / body / comments / weighted aggregate).
 3. **`server.py`** — FastAPI server wrapping scraper + sentiment into REST endpoints.
 4. **`frontend/`** — React SPA with emotion bar charts, summary cards, and live top-post examples.
