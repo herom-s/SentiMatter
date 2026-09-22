@@ -1,6 +1,7 @@
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,14 +16,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-app = FastAPI(title="SentiMatter API", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 analyzer = None
 
@@ -32,6 +25,26 @@ def get_analyzer():
     if analyzer is None:
         analyzer = SentimentAnalyzer()
     return analyzer
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        get_analyzer()
+        log.info("Emotion model loaded and ready")
+    except Exception:
+        log.exception("Could not preload emotion model — will retry on first /analyze")
+    yield
+
+
+app = FastAPI(title="SentiMatter API", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class AnalyzeRequest(BaseModel):
