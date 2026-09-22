@@ -93,3 +93,7 @@ Set the root directory to `frontend/`, then configure:
 - Python 3.12+ (see `.python-version`)
 - Node 18+ for the frontend
 - Internet connection (HuggingFace model download on first run)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
