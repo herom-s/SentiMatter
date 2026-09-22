@@ -1,8 +1,13 @@
+import base64
+import json
 import logging
+import os
 import random
 import re
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
@@ -21,6 +26,41 @@ USER_AGENTS = [
 ATOM_NS = "http://www.w3.org/2005/Atom"
 _BLOCK_TAGS = {"p", "div", "li", "blockquote", "pre", "table", "tr",
                "h1", "h2", "h3", "h4", "h5", "h6"}
+
+OAUTH_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+OAUTH_API_BASE = "https://oauth.reddit.com"
+DEFAULT_USER_AGENT = "python:sentimatter:1.0"
+
+_TOKEN = {"value": None, "expires_at": 0.0}
+_TOKEN_LOCK = threading.Lock()
+
+
+def _get_oauth_token(client_id: str, client_secret: str, user_agent: str) -> str:
+    with _TOKEN_LOCK:
+        if _TOKEN["value"] and time.time() < _TOKEN["expires_at"] - 60:
+            return _TOKEN["value"]
+        credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        body = urllib.parse.urlencode({"grant_type": "client_credentials"}).encode()
+        req = urllib.request.Request(
+            OAUTH_TOKEN_URL,
+            data=body,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "User-Agent": user_agent,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"Reddit OAuth token request failed with HTTP {e.code}") from e
+        token = payload.get("access_token")
+        if not token:
+            raise RuntimeError("Reddit OAuth response contained no access token")
+        _TOKEN["value"] = token
+        _TOKEN["expires_at"] = time.time() + float(payload.get("expires_in", 3600))
+        return token
 
 
 def _q(tag: str) -> str:
@@ -82,6 +122,10 @@ class RedditScraper:
     def __init__(self, delay=2.0, max_retries=3):
         self.delay = delay
         self.max_retries = max_retries
+        self._client_id = os.getenv("REDDIT_CLIENT_ID", "").strip()
+        self._client_secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+        self._user_agent = os.getenv("REDDIT_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
+        self.oauth_enabled = bool(self._client_id and self._client_secret)
 
     def _respect_rate_limit(self):
         time.sleep(self.delay + random.uniform(0.5, 1.5))
@@ -105,20 +149,101 @@ class RedditScraper:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     return resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as e:
-                if e.code in (403, 404, 429):
+                if e.code in (403, 404):
                     log.warning("HTTP %d fetching %s", e.code, url)
-                    reason = {403: "blocked", 404: "post not found or removed", 429: "rate limited"}
+                    reason = {403: "blocked", 404: "post not found or removed"}
                     raise RuntimeError(f"Reddit RSS returned {e.code} — {reason[e.code]}") from e
                 last_error = e
                 log.warning("HTTP %d fetching %s (attempt %d/%d)", e.code, url, attempt + 1, self.max_retries)
+                if e.code == 429 and attempt < self.max_retries - 1:
+                    backoff = 5 * (attempt + 1)
+                    log.warning("Rate limited by Reddit — backing off %ds", backoff)
+                    time.sleep(backoff)
             except (urllib.error.URLError, OSError) as e:
                 last_error = e
                 log.warning("Network error fetching %s: %s (attempt %d/%d)", url, e, attempt + 1, self.max_retries)
+        if isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429:
+            raise RuntimeError("Reddit RSS returned 429 — rate limited, try again in a minute") from last_error
         raise RuntimeError(
             f"Reddit RSS unreachable after {self.max_retries} attempts: {last_error}"
         ) from last_error
 
+    def _oauth_json(self, path: str, params: dict | None = None):
+        token = _get_oauth_token(self._client_id, self._client_secret, self._user_agent)
+        url = f"{OAUTH_API_BASE}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}", "User-Agent": self._user_agent},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                with _TOKEN_LOCK:
+                    _TOKEN["value"] = None
+                raise RuntimeError("Reddit OAuth token rejected (401) — check credentials") from e
+            raise RuntimeError(f"Reddit API returned HTTP {e.code}") from e
+
+    def _collect_comments(self, children: list, out: list[dict], cap: int = 200) -> None:
+        for child in children:
+            if len(out) >= cap:
+                return
+            if child.get("kind") != "t1":
+                continue
+            data = child.get("data", {})
+            body = (data.get("body") or "").strip()
+            if body and body not in ("[removed]", "[deleted]"):
+                out.append({
+                    "author": data.get("author") or "unknown",
+                    "score": int(data.get("score") or 0),
+                    "text": body,
+                })
+            replies = data.get("replies")
+            if isinstance(replies, dict):
+                self._collect_comments(replies.get("data", {}).get("children", []), out, cap)
+
+    @staticmethod
+    def _post_id(url: str) -> str:
+        parts = [p for p in urlparse(url).path.split("/") if p]
+        if "comments" in parts:
+            idx = parts.index("comments")
+            if idx + 1 < len(parts) and re.fullmatch(r"[A-Za-z0-9]+", parts[idx + 1]):
+                return parts[idx + 1]
+        raise ValueError(f"Not a valid Reddit post URL: {url}")
+
     def fetch_post(self, url: str) -> RedditPost:
+        if self.oauth_enabled:
+            try:
+                return self._fetch_post_oauth(url)
+            except Exception as e:
+                log.warning("Reddit OAuth fetch failed (%s) — falling back to RSS", e)
+        return self._fetch_post_rss(url)
+
+    def _fetch_post_oauth(self, url: str) -> RedditPost:
+        data = self._oauth_json(
+            f"/comments/{self._post_id(url)}",
+            {"limit": 200, "sort": "top", "raw_json": 1},
+        )
+        post = data[0]["data"]["children"][0]["data"]
+        comments: list[dict] = []
+        self._collect_comments(data[1].get("data", {}).get("children", []), comments)
+        text = (post.get("selftext") or "").strip()
+        if text in ("[removed]", "[deleted]"):
+            text = ""
+        permalink = post.get("permalink") or ""
+        return RedditPost(
+            url=f"{self.BASE}{permalink}" if permalink else url,
+            title=(post.get("title") or "").strip(),
+            author=post.get("author") or "unknown",
+            score=int(post.get("score") or 0),
+            text=text,
+            comments=comments,
+        )
+
+    def _fetch_post_rss(self, url: str) -> RedditPost:
         xml = self._fetch(self._post_feed_url(url))
         try:
             root = ET.fromstring(xml)
@@ -150,6 +275,33 @@ class RedditScraper:
         return RedditPost(url=link or url, title=title, author=author, score=0, text=text, comments=comments)
 
     def fetch_listing(self, limit: int = 10) -> list[dict]:
+        if self.oauth_enabled:
+            try:
+                return self._fetch_listing_oauth(limit)
+            except Exception as e:
+                log.warning("Reddit OAuth listing failed (%s) — falling back to RSS", e)
+        return self._fetch_listing_rss(limit)
+
+    def _fetch_listing_oauth(self, limit: int) -> list[dict]:
+        payload = self._oauth_json("/r/all/top", {"t": "day", "limit": limit, "raw_json": 1})
+        posts: list[dict] = []
+        for child in payload.get("data", {}).get("children", []):
+            post = child.get("data", {})
+            permalink = post.get("permalink") or ""
+            if not permalink:
+                continue
+            posts.append({
+                "url": f"{self.BASE}{permalink}",
+                "title": (post.get("title") or "Untitled").strip(),
+                "score": int(post.get("score") or 0),
+                "comments": int(post.get("num_comments") or 0),
+                "subreddit": post.get("subreddit") or "",
+            })
+        if not posts:
+            raise RuntimeError("No posts found in Reddit listing")
+        return posts
+
+    def _fetch_listing_rss(self, limit: int = 10) -> list[dict]:
         xml = self._fetch(f"{self.BASE}/r/all/top/.rss?t=day")
         try:
             root = ET.fromstring(xml)
