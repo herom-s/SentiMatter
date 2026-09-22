@@ -1,8 +1,12 @@
+import json
 import logging
 import random
+import threading
 
-import torch
-from transformers import pipeline
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 
 log = logging.getLogger(__name__)
 
@@ -18,36 +22,65 @@ EMOTION_LABELS = [
 ]
 
 COMMENT_LIMIT = 80
-BATCH_SIZE = 32
+BATCH_SIZE = 4
+MAX_LENGTH = 512
+BATCH_MAX_LENGTH = 192
+
+MODEL_ID = "SamLowe/roberta-base-go_emotions-onnx"
+MODEL_FILE = "onnx/model_quantized.onnx"
+TOKENIZER_FILE = "onnx/tokenizer.json"
+CONFIG_FILE = "onnx/config.json"
 
 
-def _to_scores(result):
-    return {item["label"]: round(item["score"], 4) for item in result}
+def _sigmoid(logits):
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 class SentimentAnalyzer:
-    def __init__(self, model_name="SamLowe/roberta-base-go_emotions"):
+    def __init__(self, model_name=MODEL_ID):
         log.info("Loading emotion model: %s", model_name)
-        torch.set_num_threads(4)
-        device = 0 if torch.cuda.is_available() else -1
-        self._pipe = pipeline(
-            "text-classification",
-            model=model_name,
-            top_k=None,
-            device=device,
+        model_path = hf_hub_download(model_name, MODEL_FILE)
+        tokenizer_path = hf_hub_download(model_name, TOKENIZER_FILE)
+        config_path = hf_hub_download(model_name, CONFIG_FILE)
+
+        with open(config_path, encoding="utf-8") as f:
+            id2label = json.load(f).get("id2label", {})
+        self._labels = [id2label[str(i)] for i in range(len(id2label))]
+
+        self._tokenizer = Tokenizer.from_file(tokenizer_path)
+        self._tokenizer.enable_truncation(max_length=MAX_LENGTH)
+        self._tokenizer.enable_padding()
+        self._lock = threading.Lock()
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 4
+        self._session = ort.InferenceSession(
+            model_path, sess_options=options, providers=["CPUExecutionProvider"]
         )
+        self._input_names = [i.name for i in self._session.get_inputs()]
+
+    def _score_batch(self, texts: list[str], max_length: int = MAX_LENGTH):
+        with self._lock:
+            self._tokenizer.enable_truncation(max_length=max_length)
+            encodings = self._tokenizer.encode_batch(texts)
+            feed = {
+                "input_ids": np.array([e.ids for e in encodings], dtype=np.int64),
+                "attention_mask": np.array([e.attention_mask for e in encodings], dtype=np.int64),
+            }
+            logits = self._session.run(None, {name: feed[name] for name in self._input_names})[0]
+        return _sigmoid(logits)
+
+    def _scores(self, probs) -> dict:
+        scores = {label: round(float(p), 4) for label, p in zip(self._labels, probs)}
+        for label in EMOTION_LABELS:
+            scores.setdefault(label, 0.0)
+        return scores
 
     def analyze(self, text: str) -> dict:
         if not text or not text.strip():
             return {label: 0.0 for label in EMOTION_LABELS}
 
-        results = self._pipe(text, truncation=True, max_length=512)[0]
-        scores = _to_scores(results)
-
-        for label in EMOTION_LABELS:
-            scores.setdefault(label, 0.0)
-
-        return scores
+        return self._scores(self._score_batch([text])[0])
 
     def analyze_batch(self, texts: list[str]) -> list[dict]:
         cleaned = [t if t and t.strip() else "" for t in texts]
@@ -55,15 +88,17 @@ class SentimentAnalyzer:
         if not batch:
             return [{label: 0.0 for label in EMOTION_LABELS} for _ in texts]
 
-        pipe_results = self._pipe(batch, batch_size=BATCH_SIZE, truncation=True, max_length=512)
+        chunks = [
+            self._score_batch(batch[i:i + BATCH_SIZE], BATCH_MAX_LENGTH)
+            for i in range(0, len(batch), BATCH_SIZE)
+        ]
+        probs = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+
         all_scores = []
         idx = 0
         for t in cleaned:
             if t:
-                scores = _to_scores(pipe_results[idx])
-                for label in EMOTION_LABELS:
-                    scores.setdefault(label, 0.0)
-                all_scores.append(scores)
+                all_scores.append(self._scores(probs[idx]))
                 idx += 1
             else:
                 all_scores.append({label: 0.0 for label in EMOTION_LABELS})
